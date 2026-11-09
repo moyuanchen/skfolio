@@ -2203,6 +2203,24 @@ _PLOTLY_STYLE_SCRIPT_RE = re.compile(
     r"<style>[^<]*plotly-graph-div[^<]*</style>\s*<script>[^<]*</script>"
 )
 
+# The other rich outputs of the gallery cells (pandas DataFrames, scikit-learn estimator
+# diagrams) are also emitted as verbatim HTML blocks. Their markup, inline CSS and
+# scripts bloat the LLM context, so they are removed and only the code that produced
+# them is kept. sphinx-gallery closes each block with `</div>` and two `<br />` lines.
+# The match cannot cross into the next output block, a code fence or a source marker,
+# so a block without that closing is left unchanged rather than removing code.
+_HTML_OUTPUT_OPEN = (
+    '<div class="output_subarea output_html rendered_html output_result">'
+)
+_HTML_OUTPUT_BLOCK_RE = re.compile(
+    re.escape(_HTML_OUTPUT_OPEN)
+    + r"(?:(?!"
+    + re.escape(_HTML_OUTPUT_OPEN)
+    + r"|```|<!-- GENERATED FROM PYTHON SOURCE).)*?"
+    r"</div>\n<br />\n<br />\n?",
+    flags=re.DOTALL,
+)
+
 # Remove metadata comments (e.g. `<!-- !! processed by numpydoc !! -->`) from
 # sphinx-llm pages
 _LLMS_HTML_COMMENT_RE = re.compile(r"<!--[\s\S]*?-->")
@@ -2217,21 +2235,23 @@ _LLMS_TRUNCATED_SECONDARY_LINK_RE = re.compile(
 _LLMS_TXT_ENTRY_URL_RE = re.compile(r"^- \[[^\]]*\]\((?P<url>[^)\s]+)\.html\.md\)")
 
 
-def _sanitize_llm_markdown_text(text: str) -> tuple[str, int, int]:
+def _sanitize_llm_markdown_text(text: str) -> tuple[str, int, int, int]:
     """Prepare sphinx-llm markdown text for LLM-oriented output.
 
-    Order of operations: replace Plotly HTML regions first, then remove all HTML
-    comments, collapse runs of three or more newlines to two and strip leading newlines
-    so files do not start with empty lines after comment removal.
+    Order of operations: replace Plotly HTML regions first, then remove the remaining
+    HTML cell outputs (tables and estimator diagrams), then remove all HTML comments,
+    collapse runs of three or more newlines to two and strip leading newlines so files
+    do not start with empty lines after comment removal.
     """
     n_plotly = 0
     text = _PLOTLY_STYLE_SCRIPT_RE.sub("", text)
     for regex in _PLOTLY_BLOCK_RES:
         text, n = regex.subn(_PLOTLY_PLACEHOLDER, text)
         n_plotly += n
+    text, n_outputs = _HTML_OUTPUT_BLOCK_RE.subn("", text)
     text, n_comments = _LLMS_HTML_COMMENT_RE.subn("", text)
     text = _LLMS_EXCESS_BLANK_LINES_RE.sub("\n\n", text).lstrip("\n")
-    return text, n_plotly, n_comments
+    return text, n_plotly, n_outputs, n_comments
 
 
 def _normalize_llms_txt_urls(text: str) -> tuple[str, int]:
@@ -2350,6 +2370,7 @@ def postprocess_llm_markdown_artifacts(app, exception):
     if llms_index.exists():
         targets.append(llms_index)
     total_plotly = 0
+    total_outputs = 0
     total_comments = 0
     total_normalized_urls = 0
     total_repaired_links = 0
@@ -2357,7 +2378,7 @@ def postprocess_llm_markdown_artifacts(app, exception):
     llms_txt_sections = 0
     for path in targets:
         original = path.read_text(encoding="utf-8")
-        text, n_plotly, n_comments = _sanitize_llm_markdown_text(original)
+        text, n_plotly, n_outputs, n_comments = _sanitize_llm_markdown_text(original)
         n_normalized_urls = 0
         n_repaired_links = 0
         if path == llms_index:
@@ -2366,6 +2387,7 @@ def postprocess_llm_markdown_artifacts(app, exception):
             text, llms_txt_sections = _group_llms_txt_sections(app, text)
         if (
             n_plotly
+            or n_outputs
             or n_comments
             or n_normalized_urls
             or n_repaired_links
@@ -2373,13 +2395,15 @@ def postprocess_llm_markdown_artifacts(app, exception):
         ):
             path.write_text(text, encoding="utf-8")
             total_plotly += n_plotly
+            total_outputs += n_outputs
             total_comments += n_comments
             total_normalized_urls += n_normalized_urls
             total_repaired_links += n_repaired_links
             total_files += 1
     print(
         f"[llms-postprocess] updated {total_files} file(s): "
-        f"{total_plotly} Plotly block(s), {total_comments} HTML comment(s), "
+        f"{total_plotly} Plotly block(s), {total_outputs} HTML output(s), "
+        f"{total_comments} HTML comment(s), "
         f"{total_normalized_urls} URL(s) normalized, "
         f"{total_repaired_links} truncated link(s) repaired, "
         f"{stale_files} stale file(s) removed, "
